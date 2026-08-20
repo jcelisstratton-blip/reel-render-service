@@ -71,15 +71,13 @@ app.post('/render', async (req, res) => {
     //    Cada imagen -> clip con zoom lento (Ken Burns) + crossfade entre clips
     const outPath = path.join(work, 'out.mp4');
 
-    // Construimos filtros: escala/crop a 9:16, zoompan para movimiento, xfade para transiciones
     const inputs = [];
     imgs.forEach((im) => {
       inputs.push('-loop', '1', '-t', String(im.duration), '-i', im.path);
     });
     if (audioPath) inputs.push('-i', audioPath);
 
-    // filtro por imagen: escalar cubriendo 9:16 + zoompan (Ken Burns) 
-    const D = fps; // frames por segundo
+    // filtro por imagen: escalar cubriendo 9:16 + zoompan (Ken Burns)
     let filter = '';
     imgs.forEach((im, i) => {
       const frames = Math.round(im.duration * fps);
@@ -88,6 +86,7 @@ app.post('/render', async (req, res) => {
              +  `zoompan=z='min(zoom+0.0015,1.15)':d=${frames}:s=${width}x${height}:fps=${fps},`
              +  `setsar=1[v${i}];`;
     });
+
     // encadenar con xfade (crossfade 0.5s)
     const xdur = 0.5;
     if (imgs.length === 1) {
@@ -103,9 +102,21 @@ app.post('/render', async (req, res) => {
       }
     }
 
+    // duración real del video final (suma de escenas menos el solape de cada crossfade)
+    let totalDuration = imgs.reduce((s, im) => s + im.duration, 0);
+    if (imgs.length > 1) totalDuration -= (imgs.length - 1) * xdur;
+
     const args = [...inputs, '-filter_complex', filter, '-map', '[vout]'];
     if (audioPath) {
-      args.push('-map', `${imgs.length}:a`, '-shortest', '-c:a', 'aac', '-b:a', '128k');
+      // recorta el audio a la duración del video (-shortest) y aplica fade-out de 1s
+      // justo antes del corte, para que no termine seco
+      const fadeStart = Math.max(totalDuration - 1, 0);
+      args.push(
+        '-map', `${imgs.length}:a`,
+        '-shortest',
+        '-af', `afade=t=out:st=${fadeStart.toFixed(3)}:d=1`,
+        '-c:a', 'aac', '-b:a', '128k'
+      );
     }
     args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(fps), '-y', outPath);
 
@@ -118,7 +129,6 @@ app.post('/render', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
-    // limpiar
     try { fs.rmSync(work, { recursive: true, force: true }); } catch (e) {}
   }
 });
