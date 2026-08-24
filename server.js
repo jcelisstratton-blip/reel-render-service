@@ -3,12 +3,15 @@
 // Recibe: { scenes:[{image_url, duration}], audio_url, width, height, fps }
 // Devuelve: el video MP4
 //
-// NOTA v4: agrega logging de diagnostico. El filtro sin zoompan
-// (v3) sigue fallando en produccion con "No such filter: ''" pese
-// a funcionar identico en pruebas locales. Este log imprime el
-// filter_complex y los args EXACTOS que se le mandan a ffmpeg,
-// para diagnosticar contra los logs reales de Coolify en vez de
-// seguir adivinando.
+// NOTA v5 (FIX DEFINITIVO): la causa raiz de "No such filter: ''"
+// era el punto y coma final que quedaba al armar el filter_complex
+// (cada segmento se concatena terminando en ';', incluido el
+// ultimo). ffmpeg 6.x lo tolera silenciosamente; ffmpeg 5.1.9
+// (Debian 12, el que corre en produccion) lo interpreta como un
+// intento de declarar un filtro adicional vacio y falla. Se quita
+// el ';' final antes de pasarlo a -filter_complex.
+// Diagnosticado bisectando manualmente dentro del contenedor real
+// con el ffmpeg real, no por prueba y error a ciegas.
 // ============================================================
 const express = require('express');
 const { execFile } = require('child_process');
@@ -45,7 +48,7 @@ function run(cmd, args) {
   });
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'reel-render', version: 'v4-debug' }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'reel-render', version: 'v5' }));
 
 app.post('/render', async (req, res) => {
   if (req.headers['x-token'] !== TOKEN) {
@@ -56,10 +59,6 @@ app.post('/render', async (req, res) => {
     return res.status(400).json({ error: 'scenes requerido (array de {image_url, duration})' });
   }
 
-  console.log('=== NUEVA REQUEST /render ===');
-  console.log('scenes recibidas (raw):', JSON.stringify(scenes));
-  console.log('width/height/fps:', width, height, fps, 'tipos:', typeof width, typeof height, typeof fps);
-
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'reel-'));
   try {
     const imgs = [];
@@ -68,8 +67,6 @@ app.post('/render', async (req, res) => {
       await download(scenes[i].image_url, p);
       imgs.push({ path: p, duration: scenes[i].duration || 3 });
     }
-    console.log('imgs construidos:', JSON.stringify(imgs));
-
     let audioPath = null;
     if (audio_url) {
       audioPath = path.join(work, 'audio.mp3');
@@ -84,15 +81,17 @@ app.post('/render', async (req, res) => {
     });
     if (audioPath) inputs.push('-i', audioPath);
 
+    // filtro por imagen: escalar cubriendo 9:16 + normalizar fps.
     let filter = '';
     imgs.forEach((im, i) => {
       filter += `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,`
              +  `crop=${width}:${height},setsar=1,fps=${fps}[v${i}];`;
     });
 
+    // encadenar con xfade (crossfade 0.5s)
     const xdur = 0.5;
     if (imgs.length === 1) {
-      filter += `[v0]null[vout];`;
+      filter += `[v0]copy[vout];`;
     } else {
       let prev = 'v0';
       let offset = imgs[0].duration - xdur;
@@ -103,6 +102,10 @@ app.post('/render', async (req, res) => {
         offset += imgs[i].duration - xdur;
       }
     }
+
+    // FIX CRITICO: quitar el ';' final. ffmpeg 5.1.9 lo interpreta
+    // como un filtro vacio adicional y falla con "No such filter: ''".
+    filter = filter.replace(/;$/, '');
 
     let totalDuration = imgs.reduce((s, im) => s + im.duration, 0);
     if (imgs.length > 1) totalDuration -= (imgs.length - 1) * xdur;
@@ -119,19 +122,12 @@ app.post('/render', async (req, res) => {
     }
     args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(fps), '-y', outPath);
 
-    console.log('=== FILTER_COMPLEX EXACTO ===');
-    console.log(filter);
-    console.log('=== ARGS COMPLETOS (uno por linea) ===');
-    args.forEach((a, i) => console.log(i + ': [' + a + ']'));
-    console.log('=== FIN DEBUG, llamando ffmpeg ===');
-
     await run('ffmpeg', args);
 
     const buf = fs.readFileSync(outPath);
     res.setHeader('Content-Type', 'video/mp4');
     res.send(buf);
   } catch (e) {
-    console.log('=== ERROR EN /render ===', String(e.message || e));
     res.status(500).json({ error: String(e.message || e) });
   } finally {
     try { fs.rmSync(work, { recursive: true, force: true }); } catch (e) {}
