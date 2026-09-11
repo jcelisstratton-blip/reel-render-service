@@ -120,7 +120,13 @@ app.post('/render', async (req, res) => {
         '-c:a', 'aac', '-b:a', '128k'
       );
     }
-    args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(fps), '-y', outPath);
+    // -movflags +faststart: mueve el índice del MP4 (moov atom) al principio
+    // del archivo. Sin esto queda al final (después de todo el video) y
+    // reproductores que muestran vista previa antes de bajar el archivo
+    // completo —WhatsApp Estados incluido— no lo pueden reproducir.
+    // Confirmado leyendo la estructura real de un archivo generado por este
+    // servicio: moov aparecía después de mdat.
+    args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', String(fps), '-movflags', '+faststart', '-y', outPath);
 
     await run('ffmpeg', args);
 
