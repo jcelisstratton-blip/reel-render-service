@@ -140,4 +140,65 @@ app.post('/render', async (req, res) => {
   }
 });
 
+// ============================================================
+// /compress — recomprime un video existente para que entre bajo un
+// tamaño objetivo (pensado para WhatsApp Estados: Evolution API acepta
+// cualquier peso y lo marca "sent" igual, pero WhatsApp lo descarta en
+// destino ["this video isn't available"] pasado ~16MB — confirmado en
+// vivo con reels propios de 40-50MB subidos crudos, sin comprimir).
+// Calcula el bitrate de video a partir de duración real (ffprobe) para
+// entrar en max_bytes con margen, y limita el ancho porque a esa escala
+// (status/estado) no hace falta más resolución para bajar bitrate.
+// ============================================================
+app.post('/compress', async (req, res) => {
+  if (req.headers['x-token'] !== TOKEN) {
+    return res.status(401).json({ error: 'token invalido' });
+  }
+  const { video_url, max_bytes = 15 * 1024 * 1024, max_width = 720 } = req.body;
+  if (!video_url) {
+    return res.status(400).json({ error: 'video_url requerido' });
+  }
+
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'compress-'));
+  try {
+    const inPath = path.join(work, 'in.mp4');
+    await download(video_url, inPath);
+
+    const probeOut = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', inPath]);
+    const duration = Number(JSON.parse(probeOut).format?.duration);
+    if (!duration || !isFinite(duration) || duration <= 0) {
+      return res.status(500).json({ error: 'no se pudo leer la duracion del video de entrada' });
+    }
+
+    // 90% del objetivo como margen contra el overshoot típico de un encoder
+    // de un solo paso con bitrate objetivo (no 2-pass, para no duplicar el
+    // tiempo de render en un microservicio que ya vive justo de recursos).
+    const audioKbps = 96;
+    const targetTotalKbps = ((max_bytes * 8) / 1024 / duration) * 0.9;
+    const videoKbps = Math.min(Math.max(Math.round(targetTotalKbps - audioKbps), 250), 4000);
+
+    const outPath = path.join(work, 'out.mp4');
+    await run('ffmpeg', [
+      '-i', inPath,
+      '-vf', `scale='min(iw,${max_width})':-2`,
+      '-c:v', 'libx264', '-preset', 'veryfast',
+      '-b:v', `${videoKbps}k`, '-maxrate', `${Math.round(videoKbps * 1.2)}k`, '-bufsize', `${videoKbps * 2}k`,
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', `${audioKbps}k`,
+      // Mismo motivo que en /render: sin faststart, WhatsApp Estados no
+      // reproduce el archivo (moov atom al final del MP4).
+      '-movflags', '+faststart',
+      '-y', outPath,
+    ]);
+
+    const buf = fs.readFileSync(outPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    try { fs.rmSync(work, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
 app.listen(PORT, () => console.log('reel-render en puerto ' + PORT));
